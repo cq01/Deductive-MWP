@@ -123,28 +123,34 @@ def train(config: Config, train_dataloader: DataLoader, num_epochs: int,
         model.train()
         for iter, feature in tqdm(enumerate(train_dataloader, 1), desc="--training batch", total=len(train_dataloader)):
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=bool(config.fp16)):
-                loss = model(input_ids=feature.input_ids.to(dev), attention_mask=feature.attention_mask.to(dev),
-                             token_type_ids=feature.token_type_ids.to(dev),
-                             variable_indexs_start=feature.variable_indexs_start.to(dev),
-                             variable_indexs_end=feature.variable_indexs_end.to(dev),
-                             num_variables = feature.num_variables.to(dev),
-                             variable_index_mask= feature.variable_index_mask.to(dev),
-                             labels=feature.labels.to(dev), label_height_mask= feature.label_height_mask.to(dev),
-                             return_dict=True).loss
-            if config.fp16:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-            else:
-                loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-            total_loss += loss.item()
-            if config.fp16:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            scheduler.step()
+
+            try:
+                with torch.cuda.amp.autocast(enabled=bool(config.fp16)):
+                    loss = model(input_ids=feature.input_ids.to(dev), attention_mask=feature.attention_mask.to(dev),
+                                 token_type_ids=feature.token_type_ids.to(dev),
+                                 variable_indexs_start=feature.variable_indexs_start.to(dev),
+                                 variable_indexs_end=feature.variable_indexs_end.to(dev),
+                                 num_variables=feature.num_variables.to(dev),
+                                 variable_index_mask=feature.variable_index_mask.to(dev),
+                                 labels=feature.labels.to(dev), label_height_mask=feature.label_height_mask.to(dev),
+                                 return_dict=True).loss
+                if config.fp16:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                total_loss += loss.item()
+                if config.fp16:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                scheduler.step()
+            except torch.cuda.OutOfMemoryError as e:
+                torch.cuda.empty_cache()
+                logger.warning(f'OOM!:{e}')
+
             model.zero_grad()
             if iter % 1000 == 0:
                 logger.info(f"epoch: {epoch}, iteration: {iter}, current mean loss: {total_loss/iter:.2f}")
@@ -214,32 +220,40 @@ def evaluate(valid_dataloader: DataLoader, model: nn.Module, dev: torch.device, 
     with torch.no_grad():
         for index, feature in tqdm(enumerate(valid_dataloader), desc="--validation", total=len(valid_dataloader)):
             with torch.cuda.amp.autocast(enabled=fp16):
-                module = model.module if hasattr(model, 'module') else model
-                all_logits = module(input_ids=feature.input_ids.to(dev), attention_mask=feature.attention_mask.to(dev),
-                             token_type_ids=feature.token_type_ids.to(dev),
-                             variable_indexs_start=feature.variable_indexs_start.to(dev),
-                             variable_indexs_end=feature.variable_indexs_end.to(dev),
-                             num_variables = feature.num_variables.to(dev),
-                             variable_index_mask= feature.variable_index_mask.to(dev),
-                             labels=feature.labels.to(dev), label_height_mask= feature.label_height_mask.to(dev),
-                             return_dict=True, is_eval=True).all_logits
-                batched_prediction = get_batched_prediction_consider_multiple_m0(feature=feature, all_logits=all_logits, constant_num=constant_num)
-                for b, inst_predictions in enumerate(batched_prediction):
-                    for p, prediction_step in enumerate(inst_predictions):
-                        left, right, op_id, stop_id = prediction_step
-                        if stop_id == 1:
-                            batched_prediction[b] = batched_prediction[b][:(p+1)]
-                            break
-                batched_labels = feature.labels.cpu().numpy().tolist()
-                for b, inst_labels in enumerate(batched_labels):
-                    for p, label_step in enumerate(inst_labels):
-                        left, right, op_id, stop_id = label_step
-                        if stop_id == 1:
-                            batched_labels[b] = batched_labels[b][:(p+1)]
-                            break
+                try:
+                    module = model.module if hasattr(model, 'module') else model
+                    all_logits = module(input_ids=feature.input_ids.to(dev),
+                                        attention_mask=feature.attention_mask.to(dev),
+                                        token_type_ids=feature.token_type_ids.to(dev),
+                                        variable_indexs_start=feature.variable_indexs_start.to(dev),
+                                        variable_indexs_end=feature.variable_indexs_end.to(dev),
+                                        num_variables=feature.num_variables.to(dev),
+                                        variable_index_mask=feature.variable_index_mask.to(dev),
+                                        labels=feature.labels.to(dev),
+                                        label_height_mask=feature.label_height_mask.to(dev),
+                                        return_dict=True, is_eval=True).all_logits
+                    batched_prediction = get_batched_prediction_consider_multiple_m0(feature=feature,
+                                                                                     all_logits=all_logits,
+                                                                                     constant_num=constant_num)
+                    for b, inst_predictions in enumerate(batched_prediction):
+                        for p, prediction_step in enumerate(inst_predictions):
+                            left, right, op_id, stop_id = prediction_step
+                            if stop_id == 1:
+                                batched_prediction[b] = batched_prediction[b][:(p + 1)]
+                                break
+                    batched_labels = feature.labels.cpu().numpy().tolist()
+                    for b, inst_labels in enumerate(batched_labels):
+                        for p, label_step in enumerate(inst_labels):
+                            left, right, op_id, stop_id = label_step
+                            if stop_id == 1:
+                                batched_labels[b] = batched_labels[b][:(p + 1)]
+                                break
 
-                predictions.extend(batched_prediction)
-                labels.extend(batched_labels)
+                    predictions.extend(batched_prediction)
+                    labels.extend(batched_labels)
+                except torch.cuda.OutOfMemoryError as e:
+                    logger.warning(f'OOM! :{e}')
+
     corr = 0
     num_label_step_corr = Counter()
     num_label_step_total = Counter()
